@@ -110,6 +110,21 @@ func TestCookieSession(t *testing.T) {
 	if body, err := io.ReadAll(resp.Body); err != nil && string(body) != "value1" {
 		t.Fatalf("wanted response body value1, got %s (err: %v)", string(body), err)
 	}
+
+	// clear it, and make sure it doesn't work
+	_, err = http.Get(svr.URL + "/clear")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// clear it, and make sure it doesn't work
+	resp, err = http.Get(svr.URL + "/get?key=test1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode == http.StatusOK {
+		t.Errorf("getting after clear should error")
+	}
 }
 
 func TestSerialization(t *testing.T) {

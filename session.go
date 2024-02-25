@@ -120,12 +120,12 @@ func (o *Options) newCookie(name, value string) *http.Cookie {
 type Keys interface {
 	// EncryptionKey returns the current encryption key. This will also be
 	// used for decryption.
-	EncryptionKey(context.Context) ([32]byte, error)
+	EncryptionKey() [32]byte
 	// DecryptionKeys returns a list of additional keys that can be considered
 	// for decryption. This is used to prevent invalidating current sessions
 	// when the encryption key is rotated. The current encryption key does not
 	// need to be returned in this list.
-	DecryptionKeys(context.Context) ([][32]byte, error)
+	DecryptionKeys() [][32]byte
 }
 
 // New create a new instance of the session Manager. It should be instantiated
@@ -171,7 +171,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 			ResponseWriter: w,
 			hook: func(w http.ResponseWriter) bool {
 				if sess.persist {
-					ser, err := m.serializeData(r.Context(), sess.data)
+					ser, err := m.serializeData(sess.data)
 					if err != nil {
 						m.opts.ErrorHandler(err, w, r)
 						return false
@@ -241,12 +241,7 @@ func (m *Manager[T, PtrT]) Delete(ctx context.Context) {
 	}
 }
 
-func (m *Manager[T, PtrT]) serializeData(ctx context.Context, data PtrT) (string, error) {
-	ek, err := m.keys.EncryptionKey(ctx)
-	if err != nil {
-		return "", fmt.Errorf("getting encryption key from keys: %w", err)
-	}
-
+func (m *Manager[T, PtrT]) serializeData(data PtrT) (string, error) {
 	var buf bytes.Buffer
 
 	jw := gzip.NewWriter(&buf)
@@ -257,6 +252,7 @@ func (m *Manager[T, PtrT]) serializeData(ctx context.Context, data PtrT) (string
 		return "", fmt.Errorf("closing gzip writer: %w", err)
 	}
 
+	ek := m.keys.EncryptionKey()
 	block, err := aes.NewCipher(ek[:])
 	if err != nil {
 		return "", fmt.Errorf("creating AES cipher: %w", err)
@@ -276,20 +272,13 @@ func (m *Manager[T, PtrT]) serializeData(ctx context.Context, data PtrT) (string
 	return cookieMagic + base64.RawURLEncoding.EncodeToString(ed), nil
 }
 
-func (m *Manager[T, PtrT]) deserializeData(ctx context.Context, data string) (PtrT, error) {
+func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 	if !strings.HasPrefix(data, cookieMagic) {
 		return nil, fmt.Errorf("invalid data, missing magic")
 	}
 
-	ek, err := m.keys.EncryptionKey(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting encryption key from keys: %w", err)
-	}
-
-	decKs, err := m.keys.DecryptionKeys(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting decryption keys from keys: %w", err)
-	}
+	ek := m.keys.EncryptionKey()
+	decKs := m.keys.DecryptionKeys()
 
 	db, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(data, cookieMagic))
 	if err != nil {
@@ -348,7 +337,7 @@ func (m *Manager[T, PtrT]) loadSession(r *http.Request) (PtrT, bool, error) {
 		return nil, false, fmt.Errorf("getting cookie %s: %w", sessName, err)
 	}
 
-	sd, err := m.deserializeData(r.Context(), cookie.Value)
+	sd, err := m.deserializeData(cookie.Value)
 	if err != nil {
 		return nil, false, fmt.Errorf("deserializing cookie value: %w", err)
 	}

@@ -1,7 +1,6 @@
 package cookiesession
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -128,8 +127,6 @@ func TestCookieSession(t *testing.T) {
 }
 
 func TestSerialization(t *testing.T) {
-	ctx := context.Background()
-
 	ks := newStaticKeys(t, 5)
 
 	mgr, err := New[testSession](ks, Options{})
@@ -137,12 +134,12 @@ func TestSerialization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	enc, err := mgr.serializeData(ctx, &testSession{})
+	enc, err := mgr.serializeData(&testSession{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = mgr.deserializeData(ctx, enc)
+	_, err = mgr.deserializeData(enc)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"io"
@@ -316,9 +317,12 @@ func BenchmarkEncryptionOverhead(b *testing.B) {
 		}
 		ed := append(nonce, aesgcm.Seal(nil, nonce, jbuf.Bytes(), nil)...)
 
+		edurl64 := base64.RawURLEncoding.EncodeToString(ed)
+
 		b.ReportMetric(float64(jbuf.Len())/float64(jsw.Len()), "gz/json")
 		b.ReportMetric(float64(len(ed))/float64(jbuf.Len()), "enc/gz")
 		b.ReportMetric(float64(len(ed))/float64(jsw.Len()), "encgz/json")
+		b.ReportMetric(float64(len(edurl64))/float64(jsw.Len()), "encub64gz/json")
 	}
 
 }

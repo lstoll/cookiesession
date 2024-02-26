@@ -38,6 +38,17 @@ type InitableSession interface {
 	Init()
 }
 
+// DeadlineSession is an optional interface a session data type can implement.
+// If it does, the session will not be considered valid after this date and will
+// be discarded if it's seen. This is useful because the cookie max age only
+// asks the browser to enforce that age on each save, the user can interfere
+// with it. If they do, the session will be considered valid until it's
+// encryption key is no longer used. Setting a deadline can avoid this.
+type DeadlineSession interface {
+	// NotAfter is a time we will no longer consider this session valid.
+	NotAfter() time.Time
+}
+
 // session is the type we pass around, to track things internally.
 type session[T any, PtrT SessionDataPtr[T]] struct {
 	data PtrT
@@ -150,8 +161,7 @@ func New[T any, PtrT SessionDataPtr[T]](keys Keys, opts Options) (*Manager[T, Pt
 // longer be modifiable after that.
 func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// TODO - load session
-		sd, loaded, err := m.loadSession(r)
+		sd, loaded, delete, err := m.loadSession(r)
 		if err != nil && m.opts.FailOnSessionLoadError {
 			m.opts.ErrorHandler(err, w, r)
 			return
@@ -165,30 +175,18 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 		}
 
 		sess := &session[T, PtrT]{
-			exist: loaded,
-			data:  sd,
+			exist:  loaded,
+			data:   sd,
+			delete: delete,
 		}
 
 		r = r.WithContext(context.WithValue(r.Context(), sessCtxKey{}, sess))
 		hw := &hookRW{
 			ResponseWriter: w,
 			hook: func(w http.ResponseWriter) bool {
-				if sess.persist {
-					ser, err := m.serializeData(sess.data)
-					if err != nil {
-						m.opts.ErrorHandler(err, w, r)
-						return false
-					}
-					if len(ser) > 4096 {
-						m.opts.ErrorHandler(fmt.Errorf("data size %d beyond max of 4096", len(ser)), w, r)
-						return false
-					}
-					c := m.opts.newCookie(sess.data.SessionName(), ser)
-					http.SetCookie(w, c)
-				} else if sess.delete {
-					c := m.opts.newCookie(sd.SessionName(), "")
-					c.MaxAge = -1
-					http.SetCookie(w, c)
+				if err := m.writeSession(w, sess); err != nil {
+					m.opts.ErrorHandler(err, w, r)
+					return false
 				}
 				return true
 			},
@@ -228,6 +226,7 @@ func (m *Manager[T, PtrT]) Save(ctx context.Context, updated PtrT) {
 		panic("context contained no or invalid session")
 	}
 	sess.data = updated
+	sess.delete = false
 	sess.persist = true
 }
 
@@ -320,23 +319,48 @@ func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 	return ret, nil
 }
 
-func (m *Manager[T, PtrT]) loadSession(r *http.Request) (PtrT, bool, error) {
+func (m *Manager[T, PtrT]) loadSession(r *http.Request) (_ PtrT, loaded, delete bool, _ error) {
 	sessName := PtrT(new(T)).SessionName()
 
 	cookie, err := r.Cookie(sessName)
 	if err != nil {
 		if errors.Is(err, http.ErrNoCookie) {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
-		return nil, false, fmt.Errorf("getting cookie %s: %w", sessName, err)
+		return nil, false, true, fmt.Errorf("getting cookie %s: %w", sessName, err)
 	}
 
 	sd, err := m.deserializeData(cookie.Value)
 	if err != nil {
-		return nil, false, fmt.Errorf("deserializing cookie value: %w", err)
+		return nil, false, true, fmt.Errorf("deserializing cookie value: %w", err)
 	}
 
-	return sd, true, nil
+	if ds, ok := any(sd).(DeadlineSession); ok {
+		if time.Now().After(ds.NotAfter()) {
+			return nil, false, true, nil
+		}
+	}
+
+	return sd, true, false, nil
+}
+
+func (m *Manager[T, PtrT]) writeSession(w http.ResponseWriter, sess *session[T, PtrT]) error {
+	if sess.persist {
+		ser, err := m.serializeData(sess.data)
+		if err != nil {
+			return fmt.Errorf("serializing data")
+		}
+		if len(ser) > 4096 {
+			return fmt.Errorf("data size %d beyond max of 4096", len(ser))
+		}
+		c := m.opts.newCookie(sess.data.SessionName(), ser)
+		http.SetCookie(w, c)
+	} else if sess.delete {
+		c := m.opts.newCookie(sess.data.SessionName(), "")
+		c.MaxAge = -1
+		http.SetCookie(w, c)
+	}
+	return nil
 }
 
 // hookRW can be used to trigger an action before the response writing starts,

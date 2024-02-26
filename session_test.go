@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type testSession struct {
@@ -148,6 +149,58 @@ func TestSerialization(t *testing.T) {
 	// TODO - test with dec with unknown key
 }
 
+func TestDeadlineSession(t *testing.T) {
+	mgr, err := New[testDeadlineSession](newStaticKeys(t, 1), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unexpired := &session[testDeadlineSession, *testDeadlineSession]{
+		data: &testDeadlineSession{
+			EndDate: time.Now().Add(5 * time.Minute),
+		},
+		persist: true,
+	}
+
+	got, loaded, delete := roundtripSession(t, mgr, unexpired)
+	if got == nil || loaded == false || delete == true {
+		t.Errorf("want session, loaded, not marked for delete, got: %v loaded: %t delete: %t", got, loaded, delete)
+	}
+
+	expired := &session[testDeadlineSession, *testDeadlineSession]{
+		data: &testDeadlineSession{
+			EndDate: time.Now().Add(-5 * time.Minute),
+		},
+		persist: true,
+	}
+
+	got, loaded, delete = roundtripSession(t, mgr, expired)
+	if got != nil || loaded == true || delete == false {
+		t.Errorf("want no session, unloaded, and marked for delete, got: %v loaded: %t delete: %t", got, loaded, delete)
+	}
+}
+
+// roundtripSession writes and then loads the session, returning the load result
+func roundtripSession[T any, PtrT SessionDataPtr[T]](t testing.TB, mgr *Manager[T, PtrT], sess *session[T, PtrT]) (_ PtrT, loaded, delete bool) {
+	rec := httptest.NewRecorder()
+
+	if err := mgr.writeSession(rec, sess); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	for _, c := range rec.Result().Cookies() {
+		req.AddCookie(c)
+	}
+
+	got, loaded, delete, err := mgr.loadSession(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return got, loaded, delete
+}
+
 // newStaticKeys returns a new StaticKeys with len keys, the first being for
 // encryption and the rest being for decryption
 func newStaticKeys(t testing.TB, len int) *StaticKeys {
@@ -166,4 +219,18 @@ func newStaticKeys(t testing.TB, len int) *StaticKeys {
 		Encryption: keys[0],
 		Decryption: keys[1:],
 	}
+}
+
+type testDeadlineSession struct {
+	EndDate time.Time `json:"end_date"`
+}
+
+func (testDeadlineSession) SessionName() string {
+	return "test-with-deadline"
+}
+
+var _ DeadlineSession = (*testDeadlineSession)(nil)
+
+func (t *testDeadlineSession) NotAfter() time.Time {
+	return t.EndDate
 }

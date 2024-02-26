@@ -19,7 +19,7 @@ import (
 // serialization without breaking existing data.
 const cookieMagic = "EC1."
 
-type sessCtxKey struct{}
+type sessCtxKey struct{ sessName string }
 
 // type SessionData any
 
@@ -180,7 +180,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 			delete: delete,
 		}
 
-		r = r.WithContext(context.WithValue(r.Context(), sessCtxKey{}, sess))
+		r = r.WithContext(context.WithValue(r.Context(), sessCtxKey{sessName: sess.data.SessionName()}, sess))
 		hw := &hookRW{
 			ResponseWriter: w,
 			hook: func(w http.ResponseWriter) bool {
@@ -211,7 +211,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 // If this is called inside a handler that was not Wrap'd by this manager, it
 // will panic.
 func (m *Manager[T, PtrT]) Get(ctx context.Context) (_ PtrT, existing bool) {
-	sess, ok := ctx.Value(sessCtxKey{}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{sessName: PtrT(new(T)).SessionName()}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
@@ -221,7 +221,7 @@ func (m *Manager[T, PtrT]) Get(ctx context.Context) (_ PtrT, existing bool) {
 // Save saves a modified session object. It is safe to call this repeatedly in a
 // request.
 func (m *Manager[T, PtrT]) Save(ctx context.Context, updated PtrT) {
-	sess, ok := ctx.Value(sessCtxKey{}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{PtrT(new(T)).SessionName()}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
@@ -233,7 +233,7 @@ func (m *Manager[T, PtrT]) Save(ctx context.Context, updated PtrT) {
 // Delete will mark the session to be deleted at the end of the request. It is
 // safe to subsequently create a new session  after this.
 func (m *Manager[T, PtrT]) Delete(ctx context.Context) {
-	sess, ok := ctx.Value(sessCtxKey{}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{PtrT(new(T)).SessionName()}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}

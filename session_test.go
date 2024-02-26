@@ -206,7 +206,7 @@ func roundtripSession[T any, PtrT SessionDataPtr[T]](t testing.TB, mgr *Manager[
 func newStaticKeys(t testing.TB, len int) *StaticKeys {
 	var keys [][]byte
 
-	for range 5 {
+	for range len {
 		k := make([]byte, KeySizeAES128)
 		if _, err := io.ReadFull(rand.Reader, k); err != nil {
 			t.Fatal(err)
@@ -215,10 +215,13 @@ func newStaticKeys(t testing.TB, len int) *StaticKeys {
 	}
 
 	//	start in the default state
-	return &StaticKeys{
+	sk := &StaticKeys{
 		Encryption: keys[0],
-		Decryption: keys[1:],
 	}
+	if len > 1 {
+		sk.Decryption = keys[1:]
+	}
+	return sk
 }
 
 type testDeadlineSession struct {

@@ -324,6 +324,68 @@ func BenchmarkEncryptionOverhead(b *testing.B) {
 		b.ReportMetric(float64(len(ed))/float64(jsw.Len()), "encgz/json")
 		b.ReportMetric(float64(len(edurl64))/float64(jsw.Len()), "encub64gz/json")
 	}
+}
+
+func BenchmarkKDFGCM(b *testing.B) {
+	// this benchmark exists to see the impact of the kdf-based gcm keying.
+
+	k := [32]byte{}
+	if _, err := rand.Read(k[:]); err != nil {
+		b.Fatal(err)
+	}
+
+	data := make([]byte, 4096)
+	if _, err := io.ReadFull(rand.Reader, data); err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("Plain GCM", func(b *testing.B) {
+		for range b.N {
+			block, err := aes.NewCipher(k[:])
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			aesgcm, err := cipher.NewGCM(block)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			nonce := make([]byte, 12)
+			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+				panic(err.Error())
+			}
+
+			sealed := aesgcm.Seal(nil, nonce, data, nil)
+
+			dec, err := aesgcm.Open(nil, nonce, sealed, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			if !bytes.Equal(data, dec) {
+				b.Fatal("data differs")
+			}
+		}
+	})
+
+	b.Run("Our HKDFGCM method", func(b *testing.B) {
+		for range b.N {
+			enc, err := encryptData(k[:], data, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			dec, err := decryptData(k[:], enc, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			if !bytes.Equal(data, dec) {
+				b.Fatal("data differs")
+			}
+		}
+	})
 
 }
 

@@ -4,14 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -253,21 +249,16 @@ func (m *Manager[T, PtrT]) serializeData(data PtrT) (string, error) {
 	}
 
 	ek := m.keys.EncryptionKey()
-	block, err := aes.NewCipher(ek[:])
-	if err != nil {
-		return "", fmt.Errorf("creating AES cipher: %w", err)
+
+	context := map[string]string{
+		"magic":        cookieMagic,
+		"session-name": data.SessionName(),
 	}
 
-	aesgcm, err := cipher.NewGCM(block)
+	ed, err := encryptData(ek[:], buf.Bytes(), context)
 	if err != nil {
-		return "", fmt.Errorf("creating GCM cipher: %w", err)
+		return "", fmt.Errorf("encryption failed: %w", err)
 	}
-
-	nonce := make([]byte, 12)
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("reading nonce: %w", err)
-	}
-	ed := append(nonce, aesgcm.Seal(nil, nonce, buf.Bytes(), nil)...)
 
 	return cookieMagic + base64.RawURLEncoding.EncodeToString(ed), nil
 }
@@ -277,8 +268,15 @@ func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 		return nil, fmt.Errorf("invalid data, missing magic")
 	}
 
+	ret := PtrT(new(T))
+
 	ek := m.keys.EncryptionKey()
 	decKs := m.keys.DecryptionKeys()
+
+	context := map[string]string{
+		"magic":        cookieMagic,
+		"session-name": ret.SessionName(),
+	}
 
 	db, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(data, cookieMagic))
 	if err != nil {
@@ -287,30 +285,15 @@ func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 
 	var plaintext []byte
 	for _, dk := range append([][32]byte{ek}, decKs...) {
-		block, err := aes.NewCipher(dk[:])
+		pt, err := decryptData(dk[:], db, context)
 		if err != nil {
-			return nil, fmt.Errorf("creating AES cipher: %w", err)
-		}
-
-		aesgcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return nil, fmt.Errorf("creating GCM cipher: %w", err)
-		}
-
-		pt, err := aesgcm.Open(nil, db[:12], db[12:], nil)
-		if err != nil {
-			// It would be nice if there was a better way to match the specific
-			// error reliably
 			continue
 		}
-
 		plaintext = pt
 	}
 	if plaintext == nil {
 		return nil, fmt.Errorf("failed to decrypt data")
 	}
-
-	ret := PtrT(new(T))
 
 	gr, err := gzip.NewReader(bytes.NewReader(plaintext))
 	if err != nil {

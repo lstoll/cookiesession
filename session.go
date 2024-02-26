@@ -172,6 +172,10 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 						m.opts.ErrorHandler(err, w, r)
 						return false
 					}
+					if len(ser) > 4096 {
+						m.opts.ErrorHandler(fmt.Errorf("data size %d beyond max of 4096", len(ser)), w, r)
+						return false
+					}
 					c := m.opts.newCookie(sess.data.SessionName(), ser)
 					http.SetCookie(w, c)
 				} else if sess.delete {

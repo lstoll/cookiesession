@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // cookieMagic prefixes the data, to give us the option in future to evolve the
@@ -72,10 +73,10 @@ type Options struct {
 	// Path corresponds to the HTTP Cookie Path attribute. Optional.
 	Path string
 	// MaxAge sets the MaxAge atrribute for the HTTP Cookie. The same format as
-	// *http.Cookie is used (https://pkg.go.dev/net/http#Cookie). Note that a
-	// cookie is set each time the session is saved, so this is not an absolute
-	// time from the session's creation. Optional.
-	MaxAge int
+	// *http.Cookie is used (https://pkg.go.dev/net/http#Cookie), except as a
+	// duration.. Note that a cookie is set each time the session is saved, so
+	// this is not an absolute time from the session's creation. Optional.
+	MaxAge time.Duration
 	// Insecure flags the cookie to be sent over non-https requests. It's the
 	// inverse of the HTTP cookie `Secure` attribute. Optional.
 	Insecure bool
@@ -103,7 +104,7 @@ func (o *Options) newCookie(name, value string) *http.Cookie {
 		Path:   o.Path,
 		Domain: o.Domain,
 
-		MaxAge:   o.MaxAge,
+		MaxAge:   int(o.MaxAge.Seconds()),
 		Secure:   !o.Insecure,
 		HttpOnly: true, // we should be the only consumer anyway
 		SameSite: o.SameSite,

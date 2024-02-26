@@ -151,11 +151,11 @@ func TestSerialization(t *testing.T) {
 // newStaticKeys returns a new StaticKeys with len keys, the first being for
 // encryption and the rest being for decryption
 func newStaticKeys(t testing.TB, len int) *StaticKeys {
-	var keys [][32]byte
+	var keys [][]byte
 
 	for range 5 {
-		k := [32]byte{}
-		if _, err := rand.Read(k[:]); err != nil {
+		k := make([]byte, KeySizeAES128)
+		if _, err := io.ReadFull(rand.Reader, k); err != nil {
 			t.Fatal(err)
 		}
 		keys = append(keys, k)

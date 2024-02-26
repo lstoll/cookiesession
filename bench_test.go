@@ -24,23 +24,23 @@ func BenchmarkAESDecrypt(b *testing.B) {
 	// this benchmark exists to make sure "just trying the listed keys" is fast
 	// enough.
 
-	var keys [][32]byte
+	var keys [][]byte
 
 	for range 100 {
-		k := [32]byte{}
-		if _, err := rand.Read(k[:]); err != nil {
+		k := make([]byte, KeySizeAES128)
+		if _, err := rand.Read(k); err != nil {
 			b.Fatal(err)
 		}
 		keys = append(keys, k)
 	}
 
-	randEncryptedData := func(b *testing.B, k [32]byte) (plaintext, nonce, sealed []byte) {
+	randEncryptedData := func(b *testing.B, k []byte) (plaintext, nonce, sealed []byte) {
 		plaintext = make([]byte, 4096) // 4kb, about max cookie size
 		if _, err := rand.Read(plaintext); err != nil {
 			b.Fatal(err)
 		}
 
-		block, err := aes.NewCipher(k[:])
+		block, err := aes.NewCipher(k)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -58,8 +58,8 @@ func BenchmarkAESDecrypt(b *testing.B) {
 		return plaintext, nonce, aesgcm.Seal(nil, nonce, plaintext, nil)
 	}
 
-	decryptData := func(b *testing.B, key [32]byte, nonce []byte, sealed []byte) ([]byte, bool) {
-		block, err := aes.NewCipher(key[:])
+	decryptData := func(b *testing.B, key []byte, nonce []byte, sealed []byte) ([]byte, bool) {
+		block, err := aes.NewCipher(key)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -79,7 +79,7 @@ func BenchmarkAESDecrypt(b *testing.B) {
 		return plaintext, true
 	}
 
-	benchFn := func(encKey [32]byte, decKeys [][32]byte) func(b *testing.B) {
+	benchFn := func(encKey []byte, decKeys [][]byte) func(b *testing.B) {
 		return func(b *testing.B) {
 			// encrypt with the first key
 			orig, nonce, sealed := randEncryptedData(b, encKey)
@@ -109,7 +109,7 @@ func BenchmarkAESDecrypt(b *testing.B) {
 		}
 	}
 
-	b.Run("Single Key", benchFn(keys[0], [][32]byte{keys[0]}))
+	b.Run("Single Key", benchFn(keys[0], [][]byte{keys[0]}))
 	b.Run("9 Previous Keys", benchFn(keys[9], keys[0:10]))
 	b.Run("99 Previous Keys", benchFn(keys[99], keys[0:100]))
 }
@@ -284,8 +284,8 @@ func BenchmarkEncryptionOverhead(b *testing.B) {
 
 	data := randCookieData(b)
 
-	key := [32]byte{}
-	if _, err := rand.Read(key[:]); err != nil {
+	key := make([]byte, KeySizeAES128)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		b.Fatal(err)
 	}
 
@@ -301,7 +301,7 @@ func BenchmarkEncryptionOverhead(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		block, err := aes.NewCipher(key[:])
+		block, err := aes.NewCipher(key)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -329,8 +329,8 @@ func BenchmarkEncryptionOverhead(b *testing.B) {
 func BenchmarkKDFGCM(b *testing.B) {
 	// this benchmark exists to see the impact of the kdf-based gcm keying.
 
-	k := [32]byte{}
-	if _, err := rand.Read(k[:]); err != nil {
+	k := make([]byte, KeySizeAES128)
+	if _, err := io.ReadFull(rand.Reader, k); err != nil {
 		b.Fatal(err)
 	}
 
@@ -341,7 +341,7 @@ func BenchmarkKDFGCM(b *testing.B) {
 
 	b.Run("Plain GCM", func(b *testing.B) {
 		for range b.N {
-			block, err := aes.NewCipher(k[:])
+			block, err := aes.NewCipher(k)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -371,12 +371,12 @@ func BenchmarkKDFGCM(b *testing.B) {
 
 	b.Run("Our HKDFGCM method", func(b *testing.B) {
 		for range b.N {
-			enc, err := encryptData(k[:], data, nil)
+			enc, err := encryptData(k, data, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
 
-			dec, err := decryptData(k[:], enc, nil)
+			dec, err := decryptData(k, enc, nil)
 			if err != nil {
 				b.Fatal(err)
 			}

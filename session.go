@@ -113,22 +113,28 @@ func (o *Options) newCookie(name, value string) *http.Cookie {
 
 // Keys is used to retrieve encryption/decryption keys as needed. This enables
 // the dynamic fetching/rotation of keys, which is reccomended to ensure regular
-// rotation of secrets.
+// rotation of secrets. The keys must be valid AES key sizes.
 type Keys interface {
 	// EncryptionKey returns the current encryption key. This will also be
 	// used for decryption.
-	EncryptionKey() [32]byte
+	EncryptionKey() []byte
 	// DecryptionKeys returns a list of additional keys that can be considered
 	// for decryption. This is used to prevent invalidating current sessions
 	// when the encryption key is rotated. The current encryption key does not
 	// need to be returned in this list.
-	DecryptionKeys() [][32]byte
+	DecryptionKeys() [][]byte
 }
 
 // New create a new instance of the session Manager. It should be instantiated
 // with a non-pointer type to the data structure that represents the session,
 // e.g `New[mySessionStruct](...)`.
 func New[T any, PtrT SessionDataPtr[T]](keys Keys, opts Options) (*Manager[T, PtrT], error) {
+	for _, k := range append(keys.DecryptionKeys(), keys.EncryptionKey()) {
+		if err := validateKeySize(k); err != nil {
+			return nil, fmt.Errorf("invalid key size: %w", err)
+		}
+	}
+
 	if opts.ErrorHandler == nil {
 		opts.ErrorHandler = defaultErrorHandler
 	}
@@ -260,7 +266,7 @@ func (m *Manager[T, PtrT]) serializeData(data PtrT) (string, error) {
 		"session-name": data.SessionName(),
 	}
 
-	ed, err := encryptData(ek[:], buf.Bytes(), context)
+	ed, err := encryptData(ek, buf.Bytes(), context)
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %w", err)
 	}
@@ -289,8 +295,8 @@ func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 	}
 
 	var plaintext []byte
-	for _, dk := range append([][32]byte{ek}, decKs...) {
-		pt, err := decryptData(dk[:], db, context)
+	for _, dk := range append([][]byte{ek}, decKs...) {
+		pt, err := decryptData(dk, db, context)
 		if err != nil {
 			continue
 		}

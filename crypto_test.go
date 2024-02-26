@@ -3,6 +3,7 @@ package cookiesession
 import (
 	"bytes"
 	"crypto/rand"
+	"io"
 	"reflect"
 	"testing"
 )
@@ -11,17 +12,17 @@ func TestEncryptDecrypt(t *testing.T) {
 	data := "hello world"
 	context := map[string]string{"use": "test"}
 
-	k := [32]byte{}
-	if _, err := rand.Read(k[:]); err != nil {
+	k := make([]byte, KeySizeAES128)
+	if _, err := io.ReadFull(rand.Reader, k); err != nil {
 		t.Fatal(err)
 	}
 
-	enc, err := encryptData(k[:], []byte(data), context)
+	enc, err := encryptData(k, []byte(data), context)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	dec, err := decryptData(k[:], enc, context)
+	dec, err := decryptData(k, enc, context)
 	if err != nil {
 		t.Fatal(err)
 	}

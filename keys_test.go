@@ -3,7 +3,7 @@ package cookiesession
 import "testing"
 
 func TestDeriveKeys(t *testing.T) {
-	dks, err := KeysFromPassphrases("aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb")
+	dks, err := KeysFromPassphrases(KeySizeAES128, "aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb")
 	if err != nil {
 		t.Fatal(err)
 	}

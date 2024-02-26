@@ -28,7 +28,7 @@ func BenchmarkAESDecrypt(b *testing.B) {
 
 	for range 100 {
 		k := make([]byte, KeySizeAES128)
-		if _, err := rand.Read(k); err != nil {
+		if _, err := io.ReadFull(rand.Reader, k); err != nil {
 			b.Fatal(err)
 		}
 		keys = append(keys, k)
@@ -36,7 +36,7 @@ func BenchmarkAESDecrypt(b *testing.B) {
 
 	randEncryptedData := func(b *testing.B, k []byte) (plaintext, nonce, sealed []byte) {
 		plaintext = make([]byte, 4096) // 4kb, about max cookie size
-		if _, err := rand.Read(plaintext); err != nil {
+		if _, err := io.ReadFull(rand.Reader, plaintext); err != nil {
 			b.Fatal(err)
 		}
 

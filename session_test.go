@@ -32,7 +32,7 @@ func TestCookieSession(t *testing.T) {
 	}
 
 	mux.HandleFunc("GET /set", func(w http.ResponseWriter, req *http.Request) {
-		sess, _ := mgr.Get(req.Context())
+		sess := mgr.Get(req.Context())
 
 		key := req.URL.Query().Get("key")
 		if key == "" {
@@ -60,7 +60,7 @@ func TestCookieSession(t *testing.T) {
 			t.Fatal("query with no key")
 		}
 
-		sess, _ := mgr.Get(req.Context())
+		sess := mgr.Get(req.Context())
 		t.Logf("get: %#v", sess)
 
 		value, ok := sess.KV[key]

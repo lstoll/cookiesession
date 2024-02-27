@@ -57,9 +57,6 @@ type session[T any, PtrT SessionDataPtr[T]] struct {
 	persist bool
 	// delete indicates we should delete the session at the end of the request.
 	delete bool
-	// exist flags if this session existed and was loaded from a cookie, or is a
-	// new session.
-	exist bool
 }
 
 // Manager is used to wrap a http Handler to manage fetching/setting sessions
@@ -168,14 +165,10 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 		}
 		if !loaded {
 			// either failed or loaded no cookie, init a new session.
-			sd = PtrT(new(T))
-			if is, ok := any(sd).(InitableSession); ok {
-				is.Init()
-			}
+			sd = m.newSessData()
 		}
 
 		sess := &session[T, PtrT]{
-			exist:  loaded,
 			data:   sd,
 			delete: delete,
 		}
@@ -203,19 +196,18 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 }
 
 // Get will retrieve the session from the HTTP request context. If a session
-// exists, existing will be true. If a session does not exist, a new session
-// object will be returned and exist will be false.  If a deletion has already
-// been flagged in this request, this will create a new session. If updated,
-// Save should be called.
+// exists, it will be returned. If a session does not exist, a new session
+// object will be returned.  If a deletion has already been flagged in this
+// request, this will create a new session. If updated, Save should be called.
 //
 // If this is called inside a handler that was not Wrap'd by this manager, it
 // will panic.
-func (m *Manager[T, PtrT]) Get(ctx context.Context) (_ PtrT, existing bool) {
+func (m *Manager[T, PtrT]) Get(ctx context.Context) PtrT {
 	sess, ok := ctx.Value(sessCtxKey{sessName: PtrT(new(T)).SessionName()}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
-	return sess.data, sess.exist
+	return sess.data
 }
 
 // Save saves a modified session object. It is safe to call this repeatedly in a
@@ -239,12 +231,8 @@ func (m *Manager[T, PtrT]) Delete(ctx context.Context) {
 	}
 	sess.persist = false
 	sess.delete = true
-	sess.exist = false
 	// wipe the data here, in case there's a subsequent get
-	sess.data = PtrT(new(T))
-	if is, ok := any(sess.data).(InitableSession); ok {
-		is.Init()
-	}
+	sess.data = m.newSessData()
 }
 
 func (m *Manager[T, PtrT]) serializeData(data PtrT) (string, error) {
@@ -361,6 +349,14 @@ func (m *Manager[T, PtrT]) writeSession(w http.ResponseWriter, sess *session[T, 
 		http.SetCookie(w, c)
 	}
 	return nil
+}
+
+func (m *Manager[T, PtrT]) newSessData() PtrT {
+	sd := PtrT(new(T))
+	if is, ok := any(sd).(InitableSession); ok {
+		is.Init()
+	}
+	return sd
 }
 
 // hookRW can be used to trigger an action before the response writing starts,

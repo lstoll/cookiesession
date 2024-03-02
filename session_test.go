@@ -1,13 +1,18 @@
 package cookiesession
 
 import (
-	"crypto/rand"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	sessionpb "github.com/lstoll/cookiesession/internal/proto"
+	"github.com/tink-crypto/tink-go/v2/aead"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type testSession struct {
@@ -22,115 +27,190 @@ func (t *testSession) Init() {
 	t.KV = map[string]string{}
 }
 
+func (t *testSession) GetKv() map[string]string {
+	return t.KV
+}
+
+// type kvSession interface {
+// 	SetValue(ctx context.Context, k, v string)
+// 	GetValue(context.Context) (string, bool)
+// 	Save(context.Context, )
+// }
+
+// type goKVSession struct {
+// 	mgr *Manager[testSession, *testSession]
+// }
+
+// func (g goKVSession) SetValue(ctx context.Context, k, v string) {
+// 	sess := g.mgr.Get(ctx)
+// 	if sess.KV == nil {
+// 		sess.KV =
+// 	}
+// }
+
+// type protoKVSession struct {
+// 	mgr *Manager[sessionpb.Session, *sessionpb.Session]
+// }
+
 func TestCookieSession(t *testing.T) {
 
-	mux := http.NewServeMux()
-
-	mgr, err := New[testSession](newStaticKeys(t, 1), Options{})
+	mgr, err := New[testSession]("test-sess", newHandle(t), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	mux.HandleFunc("GET /set", func(w http.ResponseWriter, req *http.Request) {
-		sess := mgr.Get(req.Context())
-
-		key := req.URL.Query().Get("key")
-		if key == "" {
-			http.Error(w, "query with no key", http.StatusInternalServerError)
-			return
-		}
-
-		value := req.URL.Query().Get("value")
-		if key == "" {
-			t.Logf("query with no value")
-			http.Error(w, "query with no value", http.StatusInternalServerError)
-			return
-		}
-
-		sess.KV[key] = value
-
-		mgr.Save(req.Context(), sess)
-
-		t.Logf("set: %#v", sess)
-	})
-
-	mux.HandleFunc("GET /get", func(w http.ResponseWriter, req *http.Request) {
-		key := req.URL.Query().Get("key")
-		if key == "" {
-			t.Fatal("query with no key")
-		}
-
-		sess := mgr.Get(req.Context())
-		t.Logf("get: %#v", sess)
-
-		value, ok := sess.KV[key]
-		if !ok {
-			t.Logf("key %s has no value", key)
-			http.Error(w, fmt.Sprintf("key %s has no value", key), http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = w.Write([]byte(value))
-	})
-
-	mux.HandleFunc("GET /clear", func(_ http.ResponseWriter, req *http.Request) {
-		mgr.Delete(req.Context())
-	})
-
-	svr := httptest.NewServer(mgr.Wrap(mux))
-	t.Cleanup(svr.Close)
-
-	resp, err := http.Get(svr.URL + "/set?key=test1&value=value1")
+	protoMgr, err := New[sessionpb.Session]("proto-sess", newHandle(t), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("set returned non-200: %d", resp.StatusCode)
-	}
+	for _, tc := range []struct {
+		Name     string
+		Wrap     func(http.Handler) http.Handler
+		SetValue func(ctx context.Context, k, v string)
+		GetValue func(ctx context.Context, k string) (string, bool)
+		Clear    func(context.Context)
+	}{
+		{
+			Name: "Go, JSON type",
+			Wrap: mgr.Wrap,
+			SetValue: func(ctx context.Context, k, v string) {
+				sess := mgr.Get(ctx)
 
-	cookies := resp.Cookies()
+				if sess.KV == nil {
+					sess.KV = make(map[string]string)
+				}
+				sess.KV[k] = v
 
-	req, err := http.NewRequest(http.MethodGet, svr.URL+"/get?key=test1", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range cookies {
-		req.AddCookie(c)
-	}
+				mgr.Save(ctx, sess)
+			},
+			GetValue: func(ctx context.Context, k string) (string, bool) {
+				sess := mgr.Get(ctx)
+				v, ok := sess.KV[k]
+				return v, ok
+			},
+			Clear: func(ctx context.Context) {
+				mgr.Delete(ctx)
+			},
+		},
+		{
+			Name: "Go, Proto type",
+			Wrap: protoMgr.Wrap,
+			SetValue: func(ctx context.Context, k, v string) {
+				sess := protoMgr.Get(ctx)
 
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("set returned non-200: %d", resp.StatusCode)
-	}
+				if sess.Kv == nil {
+					sess.Kv = make(map[string]string)
+				}
+				sess.Kv[k] = v
 
-	if body, err := io.ReadAll(resp.Body); err != nil && string(body) != "value1" {
-		t.Fatalf("wanted response body value1, got %s (err: %v)", string(body), err)
-	}
+				protoMgr.Save(ctx, sess)
+			},
+			GetValue: func(ctx context.Context, k string) (string, bool) {
+				sess := protoMgr.Get(ctx)
+				v, ok := sess.Kv[k]
+				return v, ok
+			},
+			Clear: func(ctx context.Context) {
+				protoMgr.Delete(ctx)
+			},
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			mux := http.NewServeMux()
 
-	// clear it, and make sure it doesn't work
-	_, err = http.Get(svr.URL + "/clear")
-	if err != nil {
-		t.Fatal(err)
-	}
+			mux.HandleFunc("GET /set", func(w http.ResponseWriter, req *http.Request) {
+				key := req.URL.Query().Get("key")
+				if key == "" {
+					http.Error(w, "query with no key", http.StatusInternalServerError)
+					return
+				}
 
-	// clear it, and make sure it doesn't work
-	resp, err = http.Get(svr.URL + "/get?key=test1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode == http.StatusOK {
-		t.Errorf("getting after clear should error")
+				value := req.URL.Query().Get("value")
+				if key == "" {
+					t.Logf("query with no value")
+					http.Error(w, "query with no value", http.StatusInternalServerError)
+					return
+				}
+
+				tc.SetValue(req.Context(), key, value)
+			})
+
+			mux.HandleFunc("GET /get", func(w http.ResponseWriter, req *http.Request) {
+				key := req.URL.Query().Get("key")
+				if key == "" {
+					t.Fatal("query with no key")
+				}
+
+				value, ok := tc.GetValue(req.Context(), key)
+				if !ok {
+					t.Logf("key %s has no value", key)
+					http.Error(w, fmt.Sprintf("key %s has no value", key), http.StatusInternalServerError)
+					return
+				}
+
+				_, _ = w.Write([]byte(value))
+			})
+
+			mux.HandleFunc("GET /clear", func(_ http.ResponseWriter, req *http.Request) {
+				tc.Clear(req.Context())
+			})
+
+			svr := httptest.NewServer(tc.Wrap(mux))
+			t.Cleanup(svr.Close)
+
+			resp, err := http.Get(svr.URL + "/set?key=test1&value=value1")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("set returned non-200: %d", resp.StatusCode)
+			}
+
+			cookies := resp.Cookies()
+
+			req, err := http.NewRequest(http.MethodGet, svr.URL+"/get?key=test1", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range cookies {
+				req.AddCookie(c)
+			}
+
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("set returned non-200: %d", resp.StatusCode)
+			}
+
+			if body, err := io.ReadAll(resp.Body); err != nil && string(body) != "value1" {
+				t.Fatalf("wanted response body value1, got %s (err: %v)", string(body), err)
+			}
+
+			// clear it, and make sure it doesn't work
+			_, err = http.Get(svr.URL + "/clear")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// clear it, and make sure it doesn't work
+			resp, err = http.Get(svr.URL + "/get?key=test1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode == http.StatusOK {
+				t.Errorf("getting after clear should error")
+			}
+
+		})
 	}
 }
 
 func TestSerialization(t *testing.T) {
-	ks := newStaticKeys(t, 5)
-
-	mgr, err := New[testSession](ks, Options{})
+	mgr, err := New[testSession]("test-sess", newHandle(t), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,12 +225,24 @@ func TestSerialization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// TODO - test with enc with old key
-	// TODO - test with dec with unknown key
+	protoMgr, err := New[sessionpb.Session]("proto-sess", newHandle(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enc, err = protoMgr.serializeData(&sessionpb.Session{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = protoMgr.deserializeData(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDeadlineSession(t *testing.T) {
-	mgr, err := New[testDeadlineSession](newStaticKeys(t, 1), Options{})
+	mgr, err := New[testDeadlineSession]("test-sess", newHandle(t), Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,10 +270,39 @@ func TestDeadlineSession(t *testing.T) {
 	if got != nil || loaded == true || delete == false {
 		t.Errorf("want no session, unloaded, and marked for delete, got: %v loaded: %t delete: %t", got, loaded, delete)
 	}
+
+	protoMgr, err := New[sessionpb.SessionWithDeadline]("proto-sess", newHandle(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	protoUnexpired := &session[sessionpb.SessionWithDeadline, *sessionpb.SessionWithDeadline]{
+		data: &sessionpb.SessionWithDeadline{
+			NotAfter: timestamppb.New(time.Now().Add(5 * time.Minute)),
+		},
+		persist: true,
+	}
+
+	protoGot, protoLoaded, protoDelete := roundtripSession(t, protoMgr, protoUnexpired)
+	if protoGot == nil || protoLoaded == false || protoDelete == true {
+		t.Errorf("want proto session, loaded, not marked for delete, got: %v loaded: %t delete: %t", protoGot, protoLoaded, protoDelete)
+	}
+
+	protoExpired := &session[sessionpb.SessionWithDeadline, *sessionpb.SessionWithDeadline]{
+		data: &sessionpb.SessionWithDeadline{
+			NotAfter: timestamppb.New(time.Now().Add(-5 * time.Minute)),
+		},
+		persist: true,
+	}
+
+	protoGot, protoLoaded, protoDelete = roundtripSession(t, protoMgr, protoExpired)
+	if got != nil || loaded == true || delete == false {
+		t.Errorf("want no proto session, unloaded, and marked for delete, got: %v loaded: %t delete: %t", protoGot, protoLoaded, protoDelete)
+	}
 }
 
 // roundtripSession writes and then loads the session, returning the load result
-func roundtripSession[T any, PtrT SessionDataPtr[T]](t testing.TB, mgr *Manager[T, PtrT], sess *session[T, PtrT]) (_ PtrT, loaded, delete bool) {
+func roundtripSession[T any, PtrT interface{ *T }](t testing.TB, mgr *Manager[T, PtrT], sess *session[T, PtrT]) (_ PtrT, loaded, delete bool) {
 	rec := httptest.NewRecorder()
 
 	if err := mgr.writeSession(rec, sess); err != nil {
@@ -201,27 +322,12 @@ func roundtripSession[T any, PtrT SessionDataPtr[T]](t testing.TB, mgr *Manager[
 	return got, loaded, delete
 }
 
-// newStaticKeys returns a new StaticKeys with len keys, the first being for
-// encryption and the rest being for decryption
-func newStaticKeys(t testing.TB, len int) *StaticKeys {
-	var keys [][]byte
-
-	for range len {
-		k := make([]byte, KeySizeAES128)
-		if _, err := io.ReadFull(rand.Reader, k); err != nil {
-			t.Fatal(err)
-		}
-		keys = append(keys, k)
+func newHandle(t testing.TB) KeysetHandleFunc {
+	h, err := keyset.NewHandle(aead.AES128GCMSIVKeyTemplate())
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	//	start in the default state
-	sk := &StaticKeys{
-		Encryption: keys[0],
-	}
-	if len > 1 {
-		sk.Decryption = keys[1:]
-	}
-	return sk
+	return StaticKeysetHandle(h)
 }
 
 type testDeadlineSession struct {

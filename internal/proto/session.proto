@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package lstoll.cookiesession.sample;
+option go_package = "github.com/lstoll/cookiesession/internal/sessionpb";
+
+import "google/protobuf/timestamp.proto";
+
+message Session {
+  string message = 1;
+  map<string, string> kv = 2;
+}
+
+message SessionWithDeadline {
+  string message = 1;
+  map<string, string> kv = 2;
+  google.protobuf.Timestamp not_after = 3;
+}
+
+message BenchSession {
+    message SubField {
+        string value = 1;
+    }
+    repeated string values = 1;
+    repeated SubField fields = 2;
+}

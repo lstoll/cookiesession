@@ -8,11 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tink-crypto/tink-go/v2/aead"
+	"github.com/tink-crypto/tink-go/v2/keyset"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // cookieMagic prefixes the data, to give us the option in future to evolve the
@@ -20,23 +26,6 @@ import (
 const cookieMagic = "EC1."
 
 type sessCtxKey struct{ sessName string }
-
-// type SessionData any
-
-// SessionDataPtr is the interface that a session must implement on its pointer
-// type.
-type SessionDataPtr[T any] interface {
-	*T
-	// SessionName returns the cookie name that this session should be persisted
-	// under.
-	SessionName() string
-}
-
-// InitableSession is an optional interface a session data type can implement.
-// If it does, the Init() method will be called if a new session is created.
-type InitableSession interface {
-	Init()
-}
 
 // DeadlineSession is an optional interface a session data type can implement.
 // If it does, the session will not be considered valid after this date and will
@@ -49,14 +38,36 @@ type DeadlineSession interface {
 	NotAfter() time.Time
 }
 
+// ProtoDeadlineSession is the same as DeadlineSession, except the not after is
+// provided by `google.protobuf.Timestamp not_after = X;`
+type ProtoDeadlineSession interface {
+	GetNotAfter() *timestamppb.Timestamp
+}
+
 // session is the type we pass around, to track things internally.
-type session[T any, PtrT SessionDataPtr[T]] struct {
+type session[T any, PtrT interface{ *T }] struct {
 	data PtrT
 	// persist indicates that we should persist this session at the end of the
 	// request. it has priority over delete
 	persist bool
 	// delete indicates we should delete the session at the end of the request.
 	delete bool
+}
+
+// KeysetHandleFunc is used to retrieve a handle to the current tink keyset
+// handle. The returned handle should contain the private key material for AEAD
+// usage, AES-GCM-SIV is reccomended. It is called whenever a keyset is
+// required, allowing for implementations to rotate the keyset in use as needed.
+//
+// Note - this should be updated in the background - if synchronous updates are
+// required by fetching from some source, may as well put the session in that
+// source.
+type KeysetHandleFunc func() *keyset.Handle
+
+// StaticKeysetHandle implements HandleFunc, with a keyset handle that never
+// changes.
+func StaticKeysetHandle(h *keyset.Handle) KeysetHandleFunc {
+	return func() *keyset.Handle { return h }
 }
 
 // Manager is used to wrap a http Handler to manage fetching/setting sessions
@@ -68,9 +79,10 @@ type session[T any, PtrT SessionDataPtr[T]] struct {
 // no automatic sharding is supported.
 //
 // It should be created via the New function.
-type Manager[T any, PtrT SessionDataPtr[T]] struct {
-	keys Keys
-	opts Options
+type Manager[T any, PtrT interface{ *T }] struct {
+	sessionName string
+	handleFn    KeysetHandleFunc
+	opts        Options
 }
 
 // Options are used to customize the Manager. Most options pass through to the
@@ -119,36 +131,17 @@ func (o *Options) newCookie(name, value string) *http.Cookie {
 	}
 }
 
-// Keys is used to retrieve encryption/decryption keys as needed. This enables
-// the dynamic fetching/rotation of keys, which is reccomended to ensure regular
-// rotation of secrets. The keys must be valid AES key sizes.
-type Keys interface {
-	// EncryptionKey returns the current encryption key. This will also be
-	// used for decryption.
-	EncryptionKey() []byte
-	// DecryptionKeys returns a list of additional keys that can be considered
-	// for decryption. This is used to prevent invalidating current sessions
-	// when the encryption key is rotated. The current encryption key does not
-	// need to be returned in this list.
-	DecryptionKeys() [][]byte
-}
-
 // New create a new instance of the session Manager. It should be instantiated
 // with a non-pointer type to the data structure that represents the session,
 // e.g `New[mySessionStruct](...)`.
-func New[T any, PtrT SessionDataPtr[T]](keys Keys, opts Options) (*Manager[T, PtrT], error) {
-	for _, k := range append(keys.DecryptionKeys(), keys.EncryptionKey()) {
-		if err := validateKeySize(k); err != nil {
-			return nil, fmt.Errorf("invalid key size: %w", err)
-		}
-	}
-
+func New[T any, PtrT interface{ *T }](sessionName string, handleFn KeysetHandleFunc, opts Options) (*Manager[T, PtrT], error) {
 	if opts.ErrorHandler == nil {
 		opts.ErrorHandler = defaultErrorHandler
 	}
 	return &Manager[T, PtrT]{
-		keys: keys,
-		opts: opts,
+		sessionName: sessionName,
+		handleFn:    handleFn,
+		opts:        opts,
 	}, nil
 }
 
@@ -165,7 +158,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 		}
 		if !loaded {
 			// either failed or loaded no cookie, init a new session.
-			sd = m.newSessData()
+			sd = PtrT(new(T))
 		}
 
 		sess := &session[T, PtrT]{
@@ -173,7 +166,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 			delete: delete,
 		}
 
-		r = r.WithContext(context.WithValue(r.Context(), sessCtxKey{sessName: sess.data.SessionName()}, sess))
+		r = r.WithContext(context.WithValue(r.Context(), sessCtxKey{sessName: m.sessionName}, sess))
 		hw := &hookRW{
 			ResponseWriter: w,
 			hook: func(w http.ResponseWriter) bool {
@@ -203,7 +196,7 @@ func (m *Manager[T, PtrT]) Wrap(next http.Handler) http.Handler {
 // If this is called inside a handler that was not Wrap'd by this manager, it
 // will panic.
 func (m *Manager[T, PtrT]) Get(ctx context.Context) PtrT {
-	sess, ok := ctx.Value(sessCtxKey{sessName: PtrT(new(T)).SessionName()}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{sessName: m.sessionName}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
@@ -213,7 +206,7 @@ func (m *Manager[T, PtrT]) Get(ctx context.Context) PtrT {
 // Save saves a modified session object. It is safe to call this repeatedly in a
 // request.
 func (m *Manager[T, PtrT]) Save(ctx context.Context, updated PtrT) {
-	sess, ok := ctx.Value(sessCtxKey{PtrT(new(T)).SessionName()}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{m.sessionName}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
@@ -225,35 +218,46 @@ func (m *Manager[T, PtrT]) Save(ctx context.Context, updated PtrT) {
 // Delete will mark the session to be deleted at the end of the request. It is
 // safe to subsequently create a new session  after this.
 func (m *Manager[T, PtrT]) Delete(ctx context.Context) {
-	sess, ok := ctx.Value(sessCtxKey{PtrT(new(T)).SessionName()}).(*session[T, PtrT])
+	sess, ok := ctx.Value(sessCtxKey{m.sessionName}).(*session[T, PtrT])
 	if !ok {
 		panic("context contained no or invalid session")
 	}
 	sess.persist = false
 	sess.delete = true
 	// wipe the data here, in case there's a subsequent get
-	sess.data = m.newSessData()
+	sess.data = PtrT(new(T))
 }
 
 func (m *Manager[T, PtrT]) serializeData(data PtrT) (string, error) {
+	var (
+		b   []byte
+		err error
+	)
+	if pp, isProto := any(data).(proto.Message); isProto {
+		b, err = proto.Marshal(pp)
+	} else {
+		b, err = json.Marshal(data)
+	}
+	if err != nil {
+		return "", fmt.Errorf("marshaling session data: %v", err)
+	}
+
 	var buf bytes.Buffer
 
 	jw := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(jw).Encode(data); err != nil {
-		return "", fmt.Errorf("encoding session data: %w", err)
+	if _, err := jw.Write(b); err != nil {
+		return "", fmt.Errorf("gizp session data: %w", err)
 	}
 	if err := jw.Close(); err != nil {
 		return "", fmt.Errorf("closing gzip writer: %w", err)
 	}
 
-	ek := m.keys.EncryptionKey()
-
-	context := map[string]string{
-		"magic":        cookieMagic,
-		"session-name": data.SessionName(),
+	aead, err := aead.New(m.handleFn())
+	if err != nil {
+		return "", fmt.Errorf("getting aead: %w", err)
 	}
 
-	ed, err := encryptData(ek, buf.Bytes(), context)
+	ed, err := aead.Encrypt(buf.Bytes(), m.associatedData())
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %w", err)
 	}
@@ -266,56 +270,56 @@ func (m *Manager[T, PtrT]) deserializeData(data string) (PtrT, error) {
 		return nil, fmt.Errorf("invalid data, missing magic")
 	}
 
-	ret := PtrT(new(T))
-
-	ek := m.keys.EncryptionKey()
-	decKs := m.keys.DecryptionKeys()
-
-	context := map[string]string{
-		"magic":        cookieMagic,
-		"session-name": ret.SessionName(),
+	aead, err := aead.New(m.handleFn())
+	if err != nil {
+		return nil, fmt.Errorf("getting aead: %w", err)
 	}
+
+	ret := PtrT(new(T))
 
 	db, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(data, cookieMagic))
 	if err != nil {
 		return nil, fmt.Errorf("base64 decoding data: %w", err)
 	}
 
-	var plaintext []byte
-	for _, dk := range append([][]byte{ek}, decKs...) {
-		pt, err := decryptData(dk, db, context)
-		if err != nil {
-			continue
-		}
-		plaintext = pt
-	}
-	if plaintext == nil {
-		return nil, fmt.Errorf("failed to decrypt data")
+	plaintext, err := aead.Decrypt(db, m.associatedData())
+	if err != nil {
+		return nil, fmt.Errorf("decrypting: %w", err)
 	}
 
 	gr, err := gzip.NewReader(bytes.NewReader(plaintext))
 	if err != nil {
 		return nil, fmt.Errorf("creating gzip reader: %w", err)
 	}
-	if err := json.NewDecoder(gr).Decode(&ret); err != nil {
-		return nil, fmt.Errorf("decoding json: %w", err)
+	b, err := io.ReadAll(gr)
+	if err != nil {
+		return nil, fmt.Errorf("ungz data: %v", err)
 	}
 	if err := gr.Close(); err != nil {
 		return nil, fmt.Errorf("closing gzip reader: %w", err)
+	}
+
+	if pp, isProto := any(ret).(proto.Message); isProto {
+		if err := proto.Unmarshal(b, pp); err != nil {
+			return nil, fmt.Errorf("unmarshaling proto: %w", err)
+		}
+		return pp.(PtrT), nil
+	}
+
+	if err := json.Unmarshal(b, &ret); err != nil {
+		return nil, fmt.Errorf("decoding json: %w", err)
 	}
 
 	return ret, nil
 }
 
 func (m *Manager[T, PtrT]) loadSession(r *http.Request) (_ PtrT, loaded, delete bool, _ error) {
-	sessName := PtrT(new(T)).SessionName()
-
-	cookie, err := r.Cookie(sessName)
+	cookie, err := r.Cookie(m.sessionName)
 	if err != nil {
 		if errors.Is(err, http.ErrNoCookie) {
 			return nil, false, false, nil
 		}
-		return nil, false, true, fmt.Errorf("getting cookie %s: %w", sessName, err)
+		return nil, false, true, fmt.Errorf("getting cookie %s: %w", m.sessionName, err)
 	}
 
 	sd, err := m.deserializeData(cookie.Value)
@@ -328,8 +332,17 @@ func (m *Manager[T, PtrT]) loadSession(r *http.Request) (_ PtrT, loaded, delete 
 			return nil, false, true, nil
 		}
 	}
+	if pds, ok := any(sd).(ProtoDeadlineSession); ok {
+		if time.Now().After(pds.GetNotAfter().AsTime()) {
+			return nil, false, true, nil
+		}
+	}
 
 	return sd, true, false, nil
+}
+
+func (m *Manager[T, PtrT]) associatedData() []byte {
+	return []byte(cookieMagic + m.sessionName)
 }
 
 func (m *Manager[T, PtrT]) writeSession(w http.ResponseWriter, sess *session[T, PtrT]) error {
@@ -341,22 +354,14 @@ func (m *Manager[T, PtrT]) writeSession(w http.ResponseWriter, sess *session[T, 
 		if len(ser) > 4096 {
 			return fmt.Errorf("data size %d beyond max of 4096", len(ser))
 		}
-		c := m.opts.newCookie(sess.data.SessionName(), ser)
+		c := m.opts.newCookie(m.sessionName, ser)
 		http.SetCookie(w, c)
 	} else if sess.delete {
-		c := m.opts.newCookie(sess.data.SessionName(), "")
+		c := m.opts.newCookie(m.sessionName, "")
 		c.MaxAge = -1
 		http.SetCookie(w, c)
 	}
 	return nil
-}
-
-func (m *Manager[T, PtrT]) newSessData() PtrT {
-	sd := PtrT(new(T))
-	if is, ok := any(sd).(InitableSession); ok {
-		is.Init()
-	}
-	return sd
 }
 
 // hookRW can be used to trigger an action before the response writing starts,

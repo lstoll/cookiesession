@@ -3,10 +3,6 @@ package cookiesession
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"io"
@@ -14,110 +10,19 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+
+	sessionpb "github.com/lstoll/cookiesession/internal/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func init() {
 	gob.Register(map[string]any{})
 }
 
-func BenchmarkAESDecrypt(b *testing.B) {
-	// this benchmark exists to make sure "just trying the listed keys" is fast
-	// enough.
-
-	var keys [][]byte
-
-	for range 100 {
-		k := make([]byte, KeySizeAES128)
-		if _, err := io.ReadFull(rand.Reader, k); err != nil {
-			b.Fatal(err)
-		}
-		keys = append(keys, k)
-	}
-
-	randEncryptedData := func(b *testing.B, k []byte) (plaintext, nonce, sealed []byte) {
-		plaintext = make([]byte, 4096) // 4kb, about max cookie size
-		if _, err := io.ReadFull(rand.Reader, plaintext); err != nil {
-			b.Fatal(err)
-		}
-
-		block, err := aes.NewCipher(k)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		aesgcm, err := cipher.NewGCM(block)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		nonce = make([]byte, 12)
-		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-			panic(err.Error())
-		}
-
-		return plaintext, nonce, aesgcm.Seal(nil, nonce, plaintext, nil)
-	}
-
-	decryptData := func(b *testing.B, key []byte, nonce []byte, sealed []byte) ([]byte, bool) {
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		aesgcm, err := cipher.NewGCM(block)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		plaintext, err := aesgcm.Open(nil, nonce, sealed, nil)
-		if err != nil {
-			// It would be nice if there was a better way to match the specific
-			// error reliably
-			return nil, false
-		}
-
-		return plaintext, true
-	}
-
-	benchFn := func(encKey []byte, decKeys [][]byte) func(b *testing.B) {
-		return func(b *testing.B) {
-			// encrypt with the first key
-			orig, nonce, sealed := randEncryptedData(b, encKey)
-
-			b.ResetTimer()
-
-			for range b.N {
-				var plaintext []byte
-				for _, dk := range decKeys {
-					p, ok := decryptData(b, dk, nonce, sealed)
-					if !ok {
-						continue
-					}
-					plaintext = p
-				}
-				if plaintext == nil {
-					b.Fatal("decryption failed!")
-				}
-
-				b.StopTimer()
-				if !bytes.Equal(orig, plaintext) {
-					b.Fatal("decypted data differs.")
-				}
-				b.StartTimer()
-			}
-
-		}
-	}
-
-	b.Run("Single Key", benchFn(keys[0], [][]byte{keys[0]}))
-	b.Run("9 Previous Keys", benchFn(keys[9], keys[0:10]))
-	b.Run("99 Previous Keys", benchFn(keys[99], keys[0:100]))
-}
-
 func BenchmarkSerialization(b *testing.B) {
 	// this benchmark exists to make sure our desired serialization isn't too slow
 
-	data := randCookieData(b)
+	data, protoData := randCookieData(b)
 
 	b.Run("gob", func(b *testing.B) {
 		for range b.N {
@@ -234,19 +139,89 @@ func BenchmarkSerialization(b *testing.B) {
 			}
 
 			b.StopTimer()
+
 			if !reflect.DeepEqual(data, out) {
 				b.Fatal("data differs")
 			}
 			b.StartTimer()
 		}
 	})
+
+	b.Run("protobuf", func(b *testing.B) {
+		for range b.N {
+			pb, err := proto.Marshal(protoData)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			b.SetBytes(int64(len(pb)))
+
+			out := new(sessionpb.BenchSession)
+			if err := proto.Unmarshal(pb, out); err != nil {
+				b.Fatal(err)
+			}
+
+			b.StopTimer()
+			if !proto.Equal(protoData, out) {
+				b.Fatal("data differs")
+			}
+			b.StartTimer()
+		}
+	})
+
+	b.Run("gzip protobuf", func(b *testing.B) {
+		for range b.N {
+			var buf bytes.Buffer
+
+			w := gzip.NewWriter(&buf)
+			sw := &sizeWriter{Writer: w}
+			pb, err := proto.Marshal(protoData)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := sw.Write(pb); err != nil {
+				b.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				b.Fatal(err)
+			}
+
+			// comparing the raw amout of JSON we process, to equate with the
+			// above
+			b.SetBytes(sw.Len())
+
+			out := new(sessionpb.BenchSession)
+
+			r, err := gzip.NewReader(&buf)
+			if err != nil {
+				b.Fatal(err)
+			}
+			pb, err = io.ReadAll(r)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := proto.Unmarshal(pb, out); err != nil {
+				b.Fatal(err)
+			}
+			if err := r.Close(); err != nil {
+				b.Fatal(err)
+			}
+
+			b.StopTimer()
+			if !proto.Equal(protoData, out) {
+				b.Fatal("data differs")
+			}
+			b.StartTimer()
+		}
+	})
+
 }
 
 func BenchmarkCompressionRatio(b *testing.B) {
 	// this exists to make sure compression for the data we're taking about
 	// makes sense.
 
-	data := randCookieData(b)
+	data, protoData := randCookieData(b)
 
 	for range b.N {
 		var gbuf bytes.Buffer
@@ -271,122 +246,31 @@ func BenchmarkCompressionRatio(b *testing.B) {
 			b.Fatal(err)
 		}
 
+		var pbuf bytes.Buffer
+		pw := gzip.NewWriter(&pbuf)
+		psw := sizeWriter{Writer: pw}
+		pb, err := proto.Marshal(protoData)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := psw.Write(pb); err != nil {
+			b.Fatal(err)
+		}
+		if err := pw.Close(); err != nil {
+			b.Fatal(err)
+		}
+
 		b.ReportMetric(float64(jsw.Len())/float64(gsw.Len()), "json/gob")
 		b.ReportMetric(float64(jbuf.Len())/float64(gbuf.Len()), "jsongz/gobgz")
 		b.ReportMetric(float64(jbuf.Len())/float64(jsw.Len()), "gz/json")
 		b.ReportMetric(float64(gbuf.Len())/float64(gsw.Len()), "gz/gob")
-	}
-}
 
-func BenchmarkEncryptionOverhead(b *testing.B) {
-	// this test sees how much overhead encrypting the compressed data adds. we
-	// only do this for JSON, more or less ruled gob out already.
-
-	data := randCookieData(b)
-
-	key := make([]byte, KeySizeAES128)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
-		b.Fatal(err)
-	}
-
-	for range b.N {
-		var jbuf bytes.Buffer
-
-		jw := gzip.NewWriter(&jbuf)
-		jsw := sizeWriter{Writer: jw} // track the original data
-		if err := json.NewEncoder(&jsw).Encode(data); err != nil {
-			b.Fatal(err)
-		}
-		if err := jw.Close(); err != nil {
-			b.Fatal(err)
-		}
-
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		aesgcm, err := cipher.NewGCM(block)
-		if err != nil {
-			b.Fatal(err)
-		}
-
-		nonce := make([]byte, 12)
-		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-			panic(err.Error())
-		}
-		ed := append(nonce, aesgcm.Seal(nil, nonce, jbuf.Bytes(), nil)...)
-
-		edurl64 := base64.RawURLEncoding.EncodeToString(ed)
-
+		b.ReportMetric(float64(psw.Len())/float64(jsw.Len()), "proto/jsob")
+		b.ReportMetric(float64(pbuf.Len())/float64(jbuf.Len()), "protogz/jsongz")
 		b.ReportMetric(float64(jbuf.Len())/float64(jsw.Len()), "gz/json")
-		b.ReportMetric(float64(len(ed))/float64(jbuf.Len()), "enc/gz")
-		b.ReportMetric(float64(len(ed))/float64(jsw.Len()), "encgz/json")
-		b.ReportMetric(float64(len(edurl64))/float64(jsw.Len()), "encub64gz/json")
+		b.ReportMetric(float64(gbuf.Len())/float64(gsw.Len()), "gz/gob")
+		b.ReportMetric(float64(pbuf.Len())/float64(psw.Len()), "gz/proto")
 	}
-}
-
-func BenchmarkKDFGCM(b *testing.B) {
-	// this benchmark exists to see the impact of the kdf-based gcm keying.
-
-	k := make([]byte, KeySizeAES128)
-	if _, err := io.ReadFull(rand.Reader, k); err != nil {
-		b.Fatal(err)
-	}
-
-	data := make([]byte, 4096)
-	if _, err := io.ReadFull(rand.Reader, data); err != nil {
-		b.Fatal(err)
-	}
-
-	b.Run("Plain GCM", func(b *testing.B) {
-		for range b.N {
-			block, err := aes.NewCipher(k)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			aesgcm, err := cipher.NewGCM(block)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			nonce := make([]byte, 12)
-			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-				panic(err.Error())
-			}
-
-			sealed := aesgcm.Seal(nil, nonce, data, nil)
-
-			dec, err := aesgcm.Open(nil, nonce, sealed, nil)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			if !bytes.Equal(data, dec) {
-				b.Fatal("data differs")
-			}
-		}
-	})
-
-	b.Run("Our HKDFGCM method", func(b *testing.B) {
-		for range b.N {
-			enc, err := encryptData(k, data, nil)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			dec, err := decryptData(k, enc, nil)
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			if !bytes.Equal(data, dec) {
-				b.Fatal("data differs")
-			}
-		}
-	})
-
 }
 
 var randChars = []rune(`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890`)
@@ -401,13 +285,20 @@ func randStr(n int) string {
 
 // randCookieData builds up a data structure that is roughly the max we could
 // fit in a cookie (4kb of uncompressed JSON), for comparative benchmarks
-func randCookieData(b *testing.B) map[string]any {
+func randCookieData(b *testing.B) (map[string]any, proto.Message) {
 	data := map[string]any{}
+	// in the json map, the keys are field names. they're different in proto, so
+	// to get an approximation store just the values in a list.
+	proto := &sessionpb.BenchSession{}
 	for range 10 {
-		data[randStr(10)] = randStr(20)
+		v := randStr(20)
+		data[randStr(10)] = v
+		proto.Values = append(proto.Values, v)
 		sm := map[string]any{}
 		for range 10 {
-			sm[randStr(10)] = randStr(20)
+			v := randStr(20)
+			sm[randStr(10)] = v
+			proto.Fields = append(proto.Fields, &sessionpb.BenchSession_SubField{Value: v})
 		}
 		data[randStr(10)] = sm
 	}
@@ -422,7 +313,7 @@ func randCookieData(b *testing.B) map[string]any {
 		b.Fatalf("expected random structure to be around 4096b in json, got: %d", origSize)
 	}
 
-	return data
+	return data, proto
 }
 
 // sizeWriter tracks the number of bytes written to a writer
